@@ -86,7 +86,7 @@ class CNMF(object):
                  update_background_components=True, rolling_sum = True, rolling_length = 100,
                  min_corr=.85, min_pnr=20, deconvolve_options_init=None, ring_size_factor=1.5,
 				 center_psf=True,  use_dense=True, deconv_flag = True,
-                 simultaneously=False, n_refit=0):
+                 simultaneously=False, n_refit=0, N_samples_exceptionality = 5):
         """
         Constructor of the CNMF method
 
@@ -227,6 +227,9 @@ class CNMF(object):
         n_refit : int, optional
             Number of pools (cf. oasis.pyx) prior to the last one that are refitted when
             simultaneously demixing and denoising/deconvolving.
+            
+        N_samples_exceptionality : int, optional
+            Number of consecutives intervals to be considered when testing new neuron candidates
 			
         Returns:
         --------
@@ -296,7 +299,7 @@ class CNMF(object):
         self.deconv_flag = deconv_flag
         self.simultaneously=simultaneously
         self.n_refit=n_refit
-        
+        self.N_samples_exceptionality = N_samples_exceptionality
 		
         self.min_corr = min_corr
         self.min_pnr = min_pnr
@@ -550,7 +553,7 @@ class CNMF(object):
         return self
 
     def _prepare_object(self, Yr, T, expected_comps, new_dims=None, idx_components=None,
-                        g=None, lam=None, s_min=None, bl=None, use_dense=True):
+                        g=None, lam=None, s_min=None, bl=None, use_dense=True, N_samples_exceptionality = 5):
 
         self.expected_comps = expected_comps
 
@@ -569,6 +572,7 @@ class CNMF(object):
         self.neurons_sn2 = self.neurons_sn[idx_components]
         self.lam2 = self.lam[idx_components]
         self.dims2 = self.dims
+        self.N_samples_exceptionality = N_samples_exceptionality
 
         self.N = self.A2.shape[-1]
         self.M = self.gnb + self.N
@@ -606,7 +610,8 @@ class CNMF(object):
         self.YrA2 *= nA[:, None]
 #        self.S2 *= nA[:, None]
         self.neurons_sn2 *= nA
-        self.lam2 *= nA
+        if self.p:
+            self.lam2 *= nA
         z = np.sqrt([b.T.dot(b) for b in self.b2.T])
         self.f2 *= z[:, None]
         self.b2 /= z
@@ -628,26 +633,29 @@ class CNMF(object):
         self.noisyC[self.gnb:self.M, :self.initbatch] = self.C2 + self.YrA2
         self.noisyC[:self.gnb, :self.initbatch] = self.f2
 
-        # if no parameter for calculating the spike size threshold is given, then use L1 penalty
-        if s_min is None and self.s_min is None and self.thresh_s_min is None:
-            use_L1 = True
-        else:
-            use_L1 = False
-            
-        self.OASISinstances = [oasis.OASIS(            
-            g = np.ravel(0.01) if self.p == 0 else (np.ravel(g)[0] if g is not None else gam[0]),
-            lam=0 if not use_L1 else (l if lam is None else lam),
-            # if no explicit value for s_min,  use thresh_s_min * noise estimate * sqrt(1-gamma)
-            s_min=0 if use_L1 else (s_min if s_min is not None else
-                                    (self.s_min if self.s_min is not None else
-                                     (self.thresh_s_min * sn * np.sqrt(1 - np.sum(gam))))),
-            b=b if bl is None else bl,
-            g2=0 if self.p < 2 else (np.ravel(g)[1] if g is not None else gam[1]))
-            for gam, l, b, sn in zip(self.g2, self.lam2, self.bl2, self.neurons_sn2)]
+        if self.p:
+            # if no parameter for calculating the spike size threshold is given, then use L1 penalty
+            if s_min is None and self.s_min is None and self.thresh_s_min is None:
+                use_L1 = True
+            else:
+                use_L1 = False
+                
+            self.OASISinstances = [oasis.OASIS(            
+                g = np.ravel(0.01) if self.p == 0 else (np.ravel(g)[0] if g is not None else gam[0]),
+                lam=0 if not use_L1 else (l if lam is None else lam),
+                # if no explicit value for s_min,  use thresh_s_min * noise estimate * sqrt(1-gamma)
+                s_min=0 if use_L1 else (s_min if s_min is not None else
+                                        (self.s_min if self.s_min is not None else
+                                         (self.thresh_s_min * sn * np.sqrt(1 - np.sum(gam))))),
+                b=b if bl is None else bl,
+                g2=0 if self.p < 2 else (np.ravel(g)[1] if g is not None else gam[1]))
+                for gam, l, b, sn in zip(self.g2, self.lam2, self.bl2, self.neurons_sn2)]
 
-        for i, o in enumerate(self.OASISinstances):
-            o.fit(self.noisyC[i + self.gnb, :self.initbatch])
-            self.C_on[i, :self.initbatch] = o.c
+            for i, o in enumerate(self.OASISinstances):
+                o.fit(self.noisyC[i + self.gnb, :self.initbatch])
+                self.C_on[i, :self.initbatch] = o.c
+        else:
+            self.C_on[:self.N, :self.initbatch] = self.C2
 
         self.Ab, self.ind_A, self.CY, self.CC = init_shapes_and_sufficient_stats(
             Yr[:, :self.initbatch].reshape(self.dims2 + (-1,), order='F'), self.A2,
@@ -721,24 +729,17 @@ class CNMF(object):
         frame = frame_in.astype(np.float32)
 #        print(np.max(1/scipy.sparse.linalg.norm(self.Ab,axis = 0)))
         self.Yr_buf.append(frame)
-        
-        if not self.deconv_flag:
-            simultaneously = False
-        
-        if not self.simultaneously:
+
+        if (not self.simultaneously) or self.p == 0:
             # get noisy fluor value via NNLS (project data on shapes & demix)
             C_in = self.noisyC[:self.M, t - 1].copy()
-            self.noisyC[:self.M, t] = HALS4activity(
+            self.C_on[:self.M, t], self.noisyC[:self.M, t] = HALS4activity(
                 frame, self.Ab, C_in, self.AtA, iters=num_iters_hals, groups=self.groups)
-            if self.deconv_flag:
+            if self.p:
             # denoise & deconvolve
                 for i, o in enumerate(self.OASISinstances):
                     o.fit_next(self.noisyC[nb_ + i, t])
                     self.C_on[nb_ + i, t - o.get_l_of_last_pool() + 1: t + 1] = o.get_c_of_last_pool()
-                self.C_on[:nb_, t] = self.noisyC[:nb_, t]
-            else:
-            # just denoise
-                self.C_on[:, t] = self.noisyC[:, t]
                 
         else:
             # update buffer, initialize C with previous value
@@ -782,9 +783,10 @@ class CNMF(object):
                 thresh_fitness_raw=self.thresh_fitness_raw, thresh_overlap=self.thresh_overlap,
                 groups=self.groups, batch_update_suff_stat=self.batch_update_suff_stat, gnb=self.gnb,
                 sn=self.sn, g=np.mean(self.g2) if self.p == 1 else np.mean(self.g2, 0),
-                lam=self.lam2.mean(), thresh_s_min=self.thresh_s_min, s_min=self.s_min,
+                thresh_s_min=self.thresh_s_min, s_min=self.s_min,
                 Ab_dense=self.Ab_dense[:, :self.M] if self.use_dense else None,
-                oases=self.OASISinstances)
+                oases=self.OASISinstances if self.p else None, N_samples_exceptionality=self.N_samples_exceptionality)
+
 
             num_added = len(self.ind_A) - self.N
 
@@ -814,9 +816,12 @@ class CNMF(object):
 
                 for _ct in range(self.M - num_added, self.M):
                     self.time_neuron_added.append((_ct - nb_, t))
-                    # N.B. OASISinstances are already updated within update_num_components
-                    self.C_on[_ct, t - mbs + 1:t +
-                              1] = self.OASISinstances[_ct - nb_].get_c(mbs)
+                    if self.p:
+                        # N.B. OASISinstances are already updated within update_num_components
+                        self.C_on[_ct, t - mbs + 1: t + 1] = self.OASISinstances[_ct - nb_].get_c(mbs)
+                    else:
+                        self.C_on[_ct, t - mbs + 1: t + 1] = np.maximum(0,
+                            self.noisyC[_ct, t - mbs + 1: t + 1])
                     if self.simultaneously and self.n_refit:
                         self.AtY_buf = np.concatenate((
                             self.AtY_buf, [Ab_.data[Ab_.indptr[_ct]:Ab_.indptr[_ct + 1]].dot(
@@ -890,6 +895,42 @@ class CNMF(object):
                                                        indicator_components=indicator_components)
 
                 self.AtA = (Ab_.T.dot(Ab_)).toarray()
+                
+                ind_zero = list(np.where(self.AtA.diagonal()<1e-10)[0])
+                if len(ind_zero) > 0:
+                    ind_zero.sort()
+                    ind_zero = ind_zero[::-1]
+                    ind_keep = list(set(range(Ab_.shape[-1])) - set(ind_zero))
+                    ind_keep.sort()
+                    
+                    if self.use_dense: 
+                        self.Ab_dense = np.delete(self.Ab_dense,ind_zero,axis=1)
+                    self.AtA = np.delete(self.AtA,ind_zero,axis=0)
+                    self.AtA = np.delete(self.AtA,ind_zero,axis=1)
+                    self.CY = np.delete(self.CY,ind_zero,axis=0)
+                    self.CC = np.delete(self.CC,ind_zero,axis=0)
+                    self.CC = np.delete(self.CC,ind_zero,axis=1)
+                    self.M -= len(ind_zero)
+                    self.N -= len(ind_zero)                    
+                    self.noisyC = np.delete(self.noisyC,ind_zero,axis=0)
+                    for ii in ind_zero: 
+                        del self.OASISinstances[ii-self.gnb] 
+                        #del self.ind_A[ii-self.gnb]
+                    
+                    self.C_on = np.delete(self.C_on,ind_zero,axis=0)
+                    self.AtY_buf = np.delete(self.AtY_buf,ind_zero,axis=0)
+                    print(1)
+                    #import pdb
+                    #pdb.set_trace()
+                    #Ab_ = Ab_[:,ind_keep]
+                    Ab_ = scipy.sparse.csc_matrix(Ab_[:,ind_keep])
+                    #Ab_ = scipy.sparse.csc_matrix(self.Ab_dense[:,:self.M])
+                    self.Ab_dense_copy = self.Ab_dense
+                    self.Ab_copy = Ab_
+                    self.Ab = Ab_
+                    self.ind_A = list([(self.Ab.indices[self.Ab.indptr[ii]:self.Ab.indptr[ii+1]]) for ii in range(self.gnb,self.M)])
+                    self.groups = list(map(list, update_order(Ab_)[0]))
+                
                 if self.n_refit:
                     self.AtY_buf = Ab_.T.dot(self.Yr_buf.T)
 

@@ -14,16 +14,18 @@ import warnings
 # import sparse
 import time
 import re
+import functools
 from scipy import ndimage as ndi
 from scipy import signal as sig
 from scipy.ndimage.measurements import center_of_mass
+from scipy.stats import sem
 from caiman.source_extraction.cnmf import cnmf
 from caiman import motion_correction, components_evaluation
 from skvideo import io as sio
 # from matplotlib_venn import venn2
 from collections import deque, OrderedDict
 from decimal import Decimal
-from . import numericbtree as nbtree
+# import numericbtree as nbtree
 
 
 def save_video(movpath, fname_mov_orig, fname_mov_rig, fname_AC, fname_ACbf, dsratio):
@@ -418,6 +420,16 @@ def calculate_map(dist):
 def initialize_meta_map(map_dict):
     snames = list(map_dict.keys()[np.argmax(map(len, map_dict.keys()))])
     meta_all = pd.DataFrame(pd.concat([m.reset_index() for m in map_dict.values()], ignore_index=True))
+    meta_all = reset_meta_map(meta_all, snames)
+    # meta_all = threshold_meta_map(meta_all, 10)
+    meta_all = meta_all.sort_values('nsession', ascending=False)
+    update_meta_map(meta_all, snames)
+    return meta_all, snames
+
+
+def reset_meta_map(meta_all, snames=None):
+    if not snames:
+        snames = meta_all.sessions
     meta_all[snames] = meta_all[snames].apply(pd.to_numeric, downcast='integer')
     meta_all['nsession'] = meta_all[snames].count(axis=1)
     meta_all['missing'] = [[]] * len(meta_all)
@@ -428,14 +440,15 @@ def initialize_meta_map(map_dict):
     meta_all['conflict_score'] = np.nan
     meta_all['score'] = np.nan
     meta_all['active'] = True
-    meta_all = threshold_meta_map(meta_all, 10)
-    meta_all = meta_all.sort_values('nsession', ascending=False)
-    update_meta_map(meta_all, snames)
-    return meta_all, snames
+    return meta_all
 
 
 def update_meta_map(meta_all, snames):
+    row_count = 0
     for cur_idx, cur_entry in meta_all.iterrows():
+        row_count += 1
+        if row_count % 100 == 0:
+            print ("iteration: {} out of {}".format(row_count, meta_all.shape[0]))
         cur_sname = cur_entry[snames].dropna().index
         cur_block = meta_all[meta_all['active']]
         cur_block = cur_block[pd.DataFrame(meta_all == cur_entry)[cur_sname].any(axis=1)]
@@ -564,30 +577,126 @@ def subset_data_by_map(meta_all, snames):
     return satisfied
 
 
+def infer_meta_map(meta_all, snames=None):
+    if not snames:
+        try:
+            snames = meta_all.sessions
+        except AttributeError:
+            snames = filter(lambda x: re.match('s[0-9]+$', x), meta_all.columns)
+    infer_list = []
+    for nsession in range(3, len(snames) + 1):
+        for sessions_infer in itt.combinations(snames, nsession):
+            print ("inferring " + str(sessions_infer))
+            infer = infer_map(meta_all, sessions_infer)
+            infer_list.append(infer)
+    pair_list = [subset_data_by_map(meta_all, s) for s in itt.combinations(snames, 2)]
+    meta_infer = pd.concat(infer_list + pair_list, ignore_index=True)
+    meta_infer = meta_infer.reindex_axis(meta_all.columns, axis=1)
+    meta_infer = reset_meta_map(meta_infer, snames)
+    meta_infer.sessions = snames
+    return meta_infer
+
+
 def infer_map(meta_all, snames):
     meta_pair_list = [subset_data_by_map(meta_all, s) for s in itt.combinations(snames, 2)]
-    meta_infer = meta_all.copy()
+    meta_infer = filter(lambda m: snames[0] in m.sessions, meta_pair_list)[0]
+    for cur_on in snames:
+        cur_maps = filter(lambda m: cur_on in m.sessions, meta_pair_list)
+        for cur_m in cur_maps:
+            meta_infer = extend_map(meta_infer, cur_m, cur_on)
     meta_infer.sessions = snames
-    for cur_map in meta_pair_list:
-        cur_on = list(set(meta_infer.sessions).intersection(set(cur_map.sessions)))
-        meta_infer = extend_map(meta_infer, cur_map, cur_on)
     return meta_infer
 
 
 def extend_map(mapx, mapy, on):
     if not hasattr(on, '__iter__'):
         on = [on]
-    print (mapx.sessions)
-    print (mapy.sessions)
-    print (on)
-    inter = mapx[on].reset_index().merge(mapy[on].reset_index(), on=on)
+    try:
+        inter = mapx[on].reset_index().merge(mapy[on].reset_index(), on=on)
+    except KeyError:
+        inter = pd.DataFrame()
     extended = pd.DataFrame()
+    ext_sessions = list(set(mapx.sessions).union(set(mapy.sessions)))
     for inter_idx, inter_row in inter.iterrows():
         sx = mapx.loc[inter_row.loc['index_x'], mapx.sessions]
-        sy = mapy.loc[inter_row.loc['index_y'], list(set(mapy.sessions) - set(on))]
-        extended = extended.append(pd.concat([sx, sy]), ignore_index=True)
-        extended.sessions = list(set(mapx.sessions).union(set(mapy.sessions)))
+        sy = mapy.loc[inter_row.loc['index_y'], mapy.sessions]
+        extrow = pd.concat([sx, sy]).drop_duplicates()
+        if len(extrow) <= len(ext_sessions):
+            extended = extended.append(extrow, ignore_index=True)
+    extended.sessions = ext_sessions
     return extended
+
+
+def generate_summary(mapdict, sadict):
+    if len(mapdict) != len(sadict):
+        raise ValueError("length of mappings and spatial components mismatch!")
+    exp_meta = pd.concat(mapdict, names=['animal', 'original_index']).reset_index()
+    snames = filter(lambda x: re.match('s[0-9]+$', x), exp_meta.columns)
+    exp_meta['sessions'] = exp_meta[snames].apply(lambda r: tuple(r[r.notnull()].index.tolist()), axis=1)
+    exp_meta = exp_meta.groupby('animal').apply(group_by_session)
+    summary = exp_meta.groupby(['animal', 'grouping_by_session', 'sessions']).size().reset_index(name='count')
+    grouping_dict = dict(summary.groupby(['animal', 'grouping_by_session']).groups.keys())
+    for cur_anm, cur_sa in sadict.items():
+        for cur_session, cur_s in cur_sa.items():
+            summary = summary.append(pd.Series({
+                'animal': cur_anm,
+                'grouping_by_session': grouping_dict[cur_anm],
+                'sessions': (cur_session,),
+                'count': len(cur_s.unitid)
+            }), ignore_index=True)
+    return summary, exp_meta
+
+
+def generate_overlap(summary, denominator = 'each'):
+    summary_map = summary[summary['sessions'].apply(lambda x: len(x)) > 1]
+    calculation = functools.partial(calculate_overlap, summary=summary)
+    overlaps = summary_map.groupby(['animal', 'sessions']).apply(calculation)
+    return overlaps
+
+
+def plot_overlaps(overlaps, subset):
+    overlaps['group'].replace({'shock': 'neutral', 'non-shock': 'valence'}, inplace=True)
+    overlap_mean = overlaps.groupby(['mappings', 'on', 'group']).apply(np.mean).unstack('group').reset_index()
+    overlap_std = overlaps.groupby(['mappings', 'on', 'group']).apply(np.std).unstack('group').reset_index()
+    overlap_mean_sub = overlap_mean.loc[
+                       overlap_mean.mappings.apply(lambda i: set(i) <= subset), :].set_index(['mappings', 'on'])
+    overlap_std_sub = overlap_std.loc[
+                      overlap_std.mappings.apply(lambda i: set(i) <= subset), :].set_index(['mappings', 'on'])
+    overlap_mean_sub.plot(kind='bar', yerr=overlap_std_sub)
+
+
+def calculate_overlap(mapping, summary, on='each'):
+    if isinstance(mapping, pd.DataFrame):
+        if len(mapping) > 1:
+            raise ValueError("can only handle one mapping at a time!")
+        else:
+            mapping = mapping.iloc[0]
+    if on == 'total':
+        pass
+    elif on == 'each':
+        summary_single = summary[summary['sessions'].apply(lambda x: len(x)) == 1]
+        summary_single = summary_single[summary_single['animal'] == mapping['animal']]
+        summary_single.loc[:, 'sessions'] = summary_single['sessions'].apply(set)
+        cur_snames = set(mapping['sessions'])
+        cur_dev = summary_single[summary_single['sessions'].apply(lambda s: s <= cur_snames)]
+        cur_dev.loc[:, 'sessions'] = cur_dev['sessions'].apply(tuple)
+    else:
+        cur_dev = summary.loc[(summary['sessions'] == on) & (summary['animal'] == mapping['animal'])]
+    overlap = pd.DataFrame()
+    overlap['group'] = cur_dev['group']
+    overlap['animal'] = cur_dev['animal']
+    overlap['mappings'] = [mapping['sessions']] * len(cur_dev)
+    overlap['on'] = cur_dev['sessions']
+    overlap['freq'] = mapping['count'] * 1.0 / cur_dev['count']
+    return overlap
+
+
+def group_by_session(group):
+    cur_snames = set()
+    for ss in group.sessions.unique():
+        cur_snames.update(ss)
+    group['grouping_by_session'] = [tuple(sorted(cur_snames))] * len(group)
+    return group
 
 
 def plot_spatial(alist, idlist=None, dims=None, ax=None, cmaplist=None):
@@ -703,7 +812,7 @@ def plot_components(a, c, dims, savepath=''):
     pl.ion()
 
 
-def process_data(dpath, movpath=None, pltpath=None, roi=None):
+def process_data(dpath, movpath, pltpath, roi):
     params_movie = {
         'niter_rig': 1,  # maximum number of iterations rigid motion correction,
         # in general is 1. 0 will quickly initialize a template with the first frames
@@ -863,8 +972,7 @@ def process_data(dpath, movpath=None, pltpath=None, roi=None):
         A = np.load(dpath + 'cnm.npz')['A']
         C = np.load(dpath + 'cnm.npz')['C']
         dims = np.load(dpath + 'cnm.npz')['dims']
-    if pltpath:
-        plot_components(A, C, dims, pltpath)
+    plot_components(A, C, dims, pltpath)
 
 
 def batch_process_data(animal_path, movroot, pltroot, roi):

@@ -176,23 +176,26 @@ def seeded_initialization(Y, Ain, dims = None, init_batch = 1000, gnb = 1, **kwa
 
 # definitions for demixed time series extraction and denoising/deconvolving
 @profile
-def HALS4activity(Yr, A, C, AtA, iters=5, tol=1e-3, groups=None):
+def HALS4activity(Yr, A, noisyC, AtA, iters=5, tol=1e-3, groups=None):
     """Solve C = argmin_C ||Yr-AC|| using block-coordinate decent"""
 
     AtY = A.T.dot(Yr)
     num_iters = 0
-    C_old = np.zeros(C.shape, dtype=np.float32)
+    C_old = np.zeros_like(noisyC)
+    C = noisyC.copy()
     norm = lambda c: sqrt(c.ravel().dot(c.ravel()))  # faster than np.linalg.norm
     while (norm(C_old - C) >= tol * norm(C_old)) and (num_iters < iters):
         C_old[:] = C
         if groups is None:
             for m in range(len(AtY)):
-                C[m] = max(C[m] + (AtY[m] - AtA[m].dot(C)) / AtA[m, m], 0)
+                noisyC[m] = C[m] + (AtY[m] - AtA[m].dot(C)) / AtA[m, m]
+                C[m] = max(noisyC[m], 0)
         else:
             for m in groups:
-                C[m] = np.maximum(C[m] + (AtY[m] - AtA[m].dot(C)) / AtA.diagonal()[m], 0)
+                noisyC[m] = C[m] + (AtY[m] - AtA[m].dot(C)) / AtA.diagonal()[m]
+                C[m] = np.maximum(noisyC[m], 0)
         num_iters += 1
-    return C
+    return C, noisyC
 
 
 @profile
@@ -221,6 +224,7 @@ def demix_and_deconvolve(C, noisyC, AtY, AtA, OASISinstances, iters=3, n_refit=0
         Number of previous OASIS pools to refit
         0 fits only last pool, np.inf all pools fully (i.e. starting) within buffer
     """
+    AtA += np.finfo(float).eps
     T = OASISinstances[0].t + 1
     len_buffer = C.shape[1]
     nb = AtY.shape[0] - len(OASISinstances)
@@ -228,7 +232,7 @@ def demix_and_deconvolve(C, noisyC, AtY, AtA, OASISinstances, iters=3, n_refit=0
         for i in range(iters):
             for m in range(AtY.shape[0]):
                 noisyC[m, -1] = C[m, -1] + (AtY[m, -1] - AtA[m].dot(C[:, -1])) / AtA[m, m]
-                if m >= nb:
+                if m >= nb and i > 0:                    
                     n = m - nb
                     if i == iters - 1:  # commit
                         OASISinstances[n].fit_next(noisyC[m, -1])
@@ -238,9 +242,9 @@ def demix_and_deconvolve(C, noisyC, AtY, AtA, OASISinstances, iters=3, n_refit=0
                         else:
                             C[m] = OASISinstances[n].get_c(len_buffer)
                     else:  # temporary non-commited update of most recent frame
-                        C[m] = OASISinstances[n].fit_next_tmp(noisyC[m, -1], len_buffer)
+                        C[m] = OASISinstances[n].fit_next_tmp(noisyC[m, -1], len_buffer)                
                 else:
-                    C[m, -1] = noisyC[m, -1]  # no need to enforce max(c, 0) for background, is it?
+                    C[m, -1] = np.maximum(noisyC[m, -1],0)  # no need to enforce max(c, 0) for background, is it?
     else:
         overlap = np.sum(AtA[nb:, nb:] > .1, 0) > 1  # !threshold .1 assumes normalized A (|A|_2=1)
 
@@ -330,6 +334,7 @@ def update_shapes(CY, CC, Ab, ind_A, indicator_components=None, Ab_dense=None, u
                 Ab.data[Ab.indptr[m]:Ab.indptr[m + 1]] /= \
                     max(1, sqrt(Ab.data[Ab.indptr[m]:Ab.indptr[m + 1]]
                                 .dot(Ab.data[Ab.indptr[m]:Ab.indptr[m + 1]])))
+                ind_A[m-nb] = Ab.indices[slice(Ab.indptr[m], Ab.indptr[m + 1])]
                 # N.B. Ab[ind_pixels].dot(CC[m]) is slower for csc matrix due to indexing rows
         else:
             for m in idx_comp:  # neurons
@@ -338,8 +343,11 @@ def update_shapes(CY, CC, Ab, ind_A, indicator_components=None, Ab_dense=None, u
                                                              Ab_dense[ind_pixels].dot(CC[m])) /
                                                             CC[m, m]), 0)
                 # normalize
-                Ab_dense[ind_pixels, m] = tmp / max(1, sqrt(tmp.dot(tmp)))
+                #if tmp.dot(tmp) > 0:
+                tmp *= 1e-3/min(1e-3,sqrt(tmp.dot(tmp))+np.finfo(float).eps)
+                Ab_dense[ind_pixels, m] = tmp / max(1, sqrt(tmp.dot(tmp)))                
                 Ab.data[Ab.indptr[m]:Ab.indptr[m + 1]] = Ab_dense[ind_pixels, m]
+                ind_A[m-nb] = Ab.indices[slice(Ab.indptr[m], Ab.indptr[m + 1])]
             # Ab.data[Ab.indptr[nb]:] = np.concatenate(
             #     [Ab_dense[ind_A[m - nb], m] for m in range(nb, M)])
             # N.B. why does selecting only overlapping neurons help surprisingly little, i.e
@@ -416,7 +424,7 @@ def corr(a, b):
     """
     a -= a.mean()
     b -= b.mean()
-    return a.dot(b) / sqrt(a.dot(a) * b.dot(b))
+    return a.dot(b) / sqrt(a.dot(a) * b.dot(b) + np.finfo(float).eps)
 
 
 def rank1nmf(Ypx, ain):
@@ -425,13 +433,15 @@ def rank1nmf(Ypx, ain):
         cin_res = ain.T.dot(Ypx)  # / ain.dot(ain)
         cin = np.maximum(cin_res, 0)
         ain = np.maximum(Ypx.dot(cin.T), 0)
-        ain /= sqrt(ain.dot(ain))
+        ain /= sqrt(ain.dot(ain)+ np.finfo(float).eps)
         # nc = cin.dot(cin)
         # ain = np.maximum(Ypx.dot(cin.T) / nc, 0)
         # tmp = cin - cin_old
         # if tmp.dot(tmp) < 1e-6 * nc:
         #     break
         # cin_old = cin.copy()
+    cin_res = ain.T.dot(Ypx)  # / ain.dot(ain)
+    cin = np.maximum(cin_res, 0)
     return ain, cin, cin_res
 
 
@@ -442,7 +452,7 @@ def update_num_components(t, sv, Ab, Cf, Yres_buf, Y_buf, rho_buf,
                           rval_thr=0.875, bSiz=3, robust_std=False,
                           N_samples_exceptionality=5, remove_baseline=True,
                           thresh_fitness_delta=-20, thresh_fitness_raw=-20, thresh_overlap=0.5,
-                          batch_update_suff_stat=False, sn=None, g=None, lam=0, thresh_s_min=None,
+                          batch_update_suff_stat=False, sn=None, g=None, thresh_s_min=None,
                           s_min=None, Ab_dense=None, max_num_added=1):
 
     gHalf = np.array(gSiz) // 2
@@ -590,26 +600,22 @@ def update_num_components(t, sv, Ab, Cf, Yres_buf, Y_buf, rho_buf,
 #                ind_a = uniform_filter(np.reshape(Ain.toarray(), dims, order='F'), size=bSiz)
 #                ind_a = np.reshape(ind_a > 1e-10, (np.prod(dims),), order='F')
 #                indeces_good = np.where(ind_a)[0]#np.where(determine_search_location(Ain,dims))[0]
-                if not useOASIS:
-                    # TODO: decide on a line to use for setting the parameters
-                    # # lambda from init batch (e.g. mean of lambdas)  or  s_min if either s_min or s_min_thresh are given
-                    # oas = oasis.OASIS(g=np.ravel(g)[0], lam if s_min==0 else 0, s_min, num_empty_samples=t + 1 - len(cin_res),
-                    #                   g2=0 if np.size(g) == 1 else g[1])
-                    # or
-                    # lambda from Selesnick's 3*sigma*|K| rule
-                    # use noise estimate from init batch or use std_rr?
-#                    sn_ = sqrt((ain**2).dot(sn[indeces]**2)) / sqrt(1 - g**2)
-                    sn_ = std_rr
-                    oas = oasis.OASIS(np.ravel(g)[0], 3 * sn_ /
-                                      (sqrt(1 - g**2) if np.size(g) == 1 else 
-                                        sqrt((1 + g[1]) * ((1 - g[1])**2 - g[0]**2) / (1-g[1])))
-                                      if s_min == 0 else 0,
-                                      s_min, num_empty_samples=t + 1 - len(cin_res),
-                                      g2=0 if np.size(g) == 1 else g[1])
-                    for yt in cin_res:
-                        oas.fit_next(yt)
-                        
-                oases.append(oas)
+                if oases is not None:
+                    if not useOASIS:
+                        # lambda from Selesnick's 3*sigma*|K| rule
+                        # use noise estimate from init batch or use std_rr?
+    #                    sn_ = sqrt((ain**2).dot(sn[indeces]**2)) / sqrt(1 - g**2)
+                        sn_ = std_rr
+                        oas = oasis.OASIS(np.ravel(g)[0], 3 * sn_ /
+                                          (sqrt(1 - g**2) if np.size(g) == 1 else 
+                                            sqrt((1 + g[1]) * ((1 - g[1])**2 - g[0]**2) / (1-g[1])))
+                                          if s_min == 0 else 0,
+                                          s_min, num_empty_samples=t + 1 - len(cin_res),
+                                          g2=0 if np.size(g) == 1 else g[1])
+                        for yt in cin_res:
+                            oas.fit_next(yt)
+                            
+                    oases.append(oas)
 
                 Ain_csc = scipy.sparse.csc_matrix((ain, (indeces, [0] * len(indeces))),
                                                   (np.prod(dims), 1), dtype=np.float32)
